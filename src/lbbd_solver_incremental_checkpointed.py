@@ -77,6 +77,29 @@ def checkFeasibility(solution, G, R, B):
     return True
 
 
+def _integer_lower_bound(value, tol=1e-5):
+    """Safely round a floating-point lower bound for an integer objective.
+
+    A solver may report values such as 13.0000000001 for a mathematically
+    integral bound of 13.  Applying ceil() directly would incorrectly turn
+    this into 14.  Snap values sufficiently close to an integer first;
+    otherwise ceil() is valid because the full-problem optimum is integral.
+    """
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+
+    nearest = round(value)
+    if abs(value - nearest) <= tol * max(1.0, abs(value)):
+        return int(nearest)
+    return math.ceil(value)
+
+
 def _relative_gap(lb, ub):
     """Return 100*(UB-LB)/UB when both bounds are finite and UB > 0."""
     try:
@@ -102,7 +125,7 @@ def _write_lbbd_checkpoint(path, stats, reason="periodic", checkpoint=True, othe
     if not path:
         return
 
-    lb = ceil(stats.get("best_lower_bound")) if stats.get("best_lower_bound") is not None else None     
+    lb = _integer_lower_bound(stats.get("best_lower_bound"))
     ub = stats.get("best_feasible_value")
     gap = _relative_gap(lb, ub)
     tmp_path = f"{path}.tmp.{os.getpid()}"
@@ -257,7 +280,7 @@ def solve_lbbd(
             "elapsed": time() - start_time,
             "initial_solution": initial_solution,
             "initial_value": initial_value,
-            "best_lower_bound": None if best_lower_bound == float("-inf") else ceil(best_lower_bound),
+            "best_lower_bound": None if best_lower_bound == float("-inf") else _integer_lower_bound(best_lower_bound),
             "best_feasible_solution": best_feasible_solution,
             "best_feasible_value": best_feasible_value,
             "last_master_solution": last_master_solution,
@@ -322,9 +345,12 @@ def solve_lbbd(
         if current_lb is not None:
             try:
 
-                current_lb = ceil(float(current_lb)) # Round up to nearest integer for valid LB on integer objective.   
-                if current_lb > best_lower_bound:
-                    best_lower_bound = current_lb #update best lower bound if current LB is better  
+                current_lb = _integer_lower_bound(current_lb)
+                if current_lb is not None and current_lb > best_lower_bound:
+                    # CPLEX best_bound is certified even if the master stops on
+                    # a time limit.  Never substitute the incumbent objective
+                    # for this bound unless the master is solved to optimality.
+                    best_lower_bound = current_lb
             except (TypeError, ValueError):
                 pass
 
@@ -362,16 +388,39 @@ def solve_lbbd(
         maybe_checkpoint(reason="iteration", status="running")
 
         if not violated:
-            # The current master solution satisfies all generated rows and no
-            # omitted row is violated. It is therefore feasible for the full
-            # formulation. Its objective also matches a valid restricted-master
-            # lower bound, proving global optimality.
-            best_feasible_solution = sorted(chosen)
-            best_feasible_value = int(round(last_master_objective))
-            best_lower_bound = max(best_lower_bound, last_master_objective)
-            maybe_checkpoint(reason="optimal", force=True, status="optimal", other_stats=other_stats)
+            # The incumbent satisfies every full-problem covering row, so it is
+            # a valid full-problem UB.  It proves optimality only if the current
+            # restricted master itself was solved to optimality (or, equivalently,
+            # its certified lower bound closes the integer gap).
+            candidate_value = int(round(last_master_objective))
+            if best_feasible_value is None or candidate_value < best_feasible_value:
+                best_feasible_solution = sorted(chosen)
+                best_feasible_value = candidate_value
+
+            master_proven_optimal = "optimal" in status_text
+            certified_lb = None if best_lower_bound == float("-inf") else _integer_lower_bound(best_lower_bound)
+            gap_closed = (
+                certified_lb is not None
+                and best_feasible_value is not None
+                and certified_lb >= best_feasible_value
+            )
+
+            if master_proven_optimal or gap_closed:
+                # Only now may the feasible master objective be promoted to a
+                # proof of global optimality.
+                best_lower_bound = max(best_lower_bound, candidate_value)
+                maybe_checkpoint(reason="optimal", force=True, status="optimal", other_stats=other_stats)
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+                return best_feasible_solution, mdl, make_stats("optimal", other_stats=other_stats)
+
+            # A time-limited (or otherwise nonoptimal) master incumbent can be
+            # a valid UB for the full problem, but its objective is NOT a valid
+            # LB. Preserve only CPLEX's certified best_bound.
+            status = "time_limit" if "time" in status_text else "master_not_optimal"
+            maybe_checkpoint(reason="full-feasible-master-not-proven", force=True,
+                             status=status, other_stats=other_stats)
             signal.signal(signal.SIGTERM, previous_sigterm_handler)
-            return best_feasible_solution, mdl, make_stats("optimal", other_stats=other_stats)
+            return best_feasible_solution, mdl, make_stats(status, other_stats=other_stats)
 
         selected_pairs = select_violated_pairs(
             violated,
