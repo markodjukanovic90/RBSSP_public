@@ -863,12 +863,17 @@ def solve_bbc(
 # ---------------------------------------------------------------------------
 
 def main():
+    # Global wall-clock timer: --time_limit applies to the complete algorithm,
+    # including input reading, sanity checking, GRASP, preprocessing/kernelization,
+    # model construction, and the BBC/CPLEX phase.
+    algorithm_start_time = time()
+
     parser = argparse.ArgumentParser(
         description="Branch-and-Benders-Cut (BBC) Red-Blue Separator sa CPLEX lazy constraints"
     )
     parser.add_argument("-i", "--i", required=True, help="Input CSV graph file (DIMACS-like format)")
     parser.add_argument("-o", "--o", required=True, help="Output file path for results")
-    parser.add_argument("-t", "--time_limit", type=float, default=60.0, help="CPLEX time limit in seconds")
+    parser.add_argument("-t", "--time_limit", type=float, default=60.0, help="Global wall-clock limit in seconds for GRASP, preprocessing, model construction, and BBC/CPLEX together.")
     parser.add_argument("-gk", "--grasp_k", type=int, default=5, help="k parametar za GRASP greedy")
     parser.add_argument("-gi", "--grasp_iter", type=int, default=10, help="Broj GRASP iteracija")
     parser.add_argument(
@@ -956,6 +961,7 @@ def main():
     heuristic_solution = None
     heuristic_value = None
     grasp_feasible = False
+    grasp_time_overall = None
 
     if sanity:
         print(f"Running GRASP warm start with {args.grasp_iter} iterations and k={args.grasp_k}")
@@ -963,7 +969,17 @@ def main():
             
             from LS import build_pair_cover_map
             pair_sets_grasp =  build_pair_cover_map(G, R, B)
-            candidate = grasp_mrbssp(G=G, R=R, B=B, k=int(args.grasp_k), max_iter=int(args.grasp_iter), seed=None, pair_cover_map=pair_sets_grasp) #, time_limit
+            grasp_start_time = time()
+            candidate = grasp_mrbssp(
+                G=G,
+                R=R,
+                B=B,
+                k=int(args.grasp_k),
+                max_iter=int(args.grasp_iter),
+                seed=None,
+                pair_cover_map=pair_sets_grasp,
+            )
+            grasp_time_overall = time() - grasp_start_time
 
         except Exception as exc:
             print(f"WARNING: GRASP failed ({type(exc).__name__}: {exc}).")
@@ -1005,6 +1021,8 @@ def main():
 
     if sanity:
 
+        preprocessing_start_time = time()
+
         # Build D(r,b) only from selectable vertices. Forbidden vertices are
         # therefore not part of any separation set and can never become essential.
         pair_sets = compute_separation_sets(
@@ -1025,6 +1043,7 @@ def main():
 
         all_nodes = set(selectable_nodes)
         pair_sets, all_nodes = kernelize(pair_sets, essential, all_nodes)
+        preprocessing_time_overall = time() - preprocessing_start_time
 
         print("Remaining nodes after kernelization:", len(all_nodes))
         print("Remaining rows:", len(pair_sets))
@@ -1073,10 +1092,18 @@ def main():
             ub=heuristic_value,
         )
 
-        start = time()
+        elapsed_before_bbc = time() - algorithm_start_time
+        remaining_for_bbc = max(0.0, time_limit - elapsed_before_bbc)
+        bbc_skipped_due_to_time = remaining_for_bbc <= 0.0
+
+        print(
+            f"Elapsed before BBC solve: {elapsed_before_bbc:.2f}s; "
+            f"remaining global budget for BBC: {remaining_for_bbc:.2f}s"
+        )
+
         progress_state = BBCProgressState(
             output_file=output_file,
-            start_wall=start,
+            start_wall=algorithm_start_time,
             initial_ub=heuristic_value,
             initial_lb=len(essential),
             initial_solution=heuristic_solution,
@@ -1103,26 +1130,40 @@ def main():
         old_sigint = signal.signal(signal.SIGINT, _termination_handler)
 
         try:
-            sol, cb = solve_bbc(
-                mdl,
-                x_vars,
-                remaining_nodes,
-                callback_pair_sets,
-                essential,
-                time_limit,
-                max_cuts_per_call=args.max_cuts_per_callback,
-                cut_strategy=args.cut_strategy,
-                progress_state=progress_state,
-            )
+            if bbc_skipped_due_to_time:
+                print("Global time limit reached before BBC/CPLEX solve; skipping BBC.")
+                sol = None
+                cb = None
+                progress_state.write_checkpoint(
+                    reason="global-time-limit-before-BBC",
+                    status="TIME_LIMIT",
+                    force=True,
+                )
+            else:
+                sol, cb = solve_bbc(
+                    mdl,
+                    x_vars,
+                    remaining_nodes,
+                    callback_pair_sets,
+                    essential,
+                    remaining_for_bbc,
+                    max_cuts_per_call=args.max_cuts_per_callback,
+                    cut_strategy=args.cut_strategy,
+                    progress_state=progress_state,
+                )
         finally:
             signal.signal(signal.SIGTERM, old_sigterm)
             signal.signal(signal.SIGINT, old_sigint)
 
-        total_time = round(time() - start, 2)
+        total_time = round(time() - algorithm_start_time, 2)
 
-        nb_cuts = cb.nb_cuts
-        nb_calls = cb.nb_calls
-        max_violated_in_call = cb.max_violated_in_call
+        nb_cuts = cb.nb_cuts if cb is not None else progress_state.nb_cuts
+        nb_calls = cb.nb_calls if cb is not None else progress_state.nb_calls
+        max_violated_in_call = (
+            cb.max_violated_in_call
+            if cb is not None
+            else progress_state.max_violated_in_call
+        )
         progress_state.nb_cuts = nb_cuts
         progress_state.nb_calls = nb_calls
         progress_state.max_violated_in_call = max_violated_in_call
@@ -1158,10 +1199,17 @@ def main():
             except Exception:
                 lb = progress_state.current_lb if progress_state.current_lb is not None else -1
 
-            status = "No CPLEX incumbent"
+            status = (
+                "Global time limit reached before BBC solve"
+                if bbc_skipped_due_to_time
+                else "No CPLEX incumbent"
+            )
             feas = bool(heuristic_solution is not None)
 
     else:
+
+        total_time = round(time() - algorithm_start_time, 2)
+        preprocessing_time_overall = None
 
         bbc_solution = []
         ub = -1
@@ -1187,6 +1235,8 @@ def main():
         f.write(f"Status: {status}\n")
         f.write(f"Feasible: {feas}\n")
         f.write(f"Time: {total_time}\n")
+        f.write(f"PreprocessingTime: {preprocessing_time_overall}\n")
+        f.write(f"GRASPTime: {grasp_time_overall}\n")
 
         #initial (GRASP) solution stats:
         f.write(f"InitialSolutionValue: {heuristic_value}\n")

@@ -615,7 +615,7 @@ def main():
     )
     parser.add_argument("-i", "--i", required=True, help="Input CSV graph file in DIMACS format")
     parser.add_argument("-o", "--o", required=True, help="Output file path for results/checkpoints")
-    parser.add_argument("-t", "--time_limit", type=float, default=1200.0, help="CPLEX time limit in seconds")
+    parser.add_argument("-t", "--time_limit", type=float, default=1200.0, help="Global wall-clock limit in seconds for GRASP, preprocessing, model generation, and CPLEX together.")
     parser.add_argument("-warm", "--warm_start", type=int, default=1, help="Use GRASP warm start (1=yes, 0=no)")
     parser.add_argument(
         "--checkpoint_seconds",
@@ -650,11 +650,28 @@ def main():
         "NodesLeft": -1,
     }
 
+    def global_time_remaining():
+        return time_limit - (time() - overall_start)
+
+    def stop_before_cplex(reason, other_stats=None):
+        """Write a final checkpoint when preprocessing used the full global budget."""
+        state["Status"] = "TIME_LIMIT"
+        state["Time"] = time() - overall_start
+        state["InitialSolutionValue"] = (
+            heuristic_value if "heuristic_value" in locals() and heuristic_value is not None else -1
+        )
+        state["InitialSolutionNodes"] = (
+            sorted(heuristic_solution)
+            if "heuristic_solution" in locals() and heuristic_solution is not None
+            else []
+        )
+        write_checkpoint(output_file, state, False, reason, other_stats)
+
     # Best-effort final snapshot when SLURM sends SIGTERM before SIGKILL.
     def _handle_signal(signum, frame, other_stats=None):
         state["Status"] = "INTERRUPTED"
         state["TimeOverall"] = time() - overall_start
-        state["Time"] = time() - solve_start
+        state["Time"] = time() - overall_start
 
         try:
             write_checkpoint(output_file, state, True, f"signal-{signum}", other_stats=other_stats  )
@@ -692,7 +709,7 @@ def main():
             from LS import build_pair_cover_map
             pair_sets_grasp =  build_pair_cover_map(G, R, B)
             grasp_start = time()
-            candidate = grasp_mrbssp(G=G, R=R, B=B, k=5, max_iter=10, seed=None, pair_cover_map=pair_sets_grasp, forbidden=None ) #, time_limit)
+            candidate = grasp_mrbssp(G=G, R=R, B=B, k=5, max_iter=10, seed=None, pair_cover_map=pair_sets_grasp) #, time_limit)
             grasp_time = time() - grasp_start   
 
         except Exception as exc:
@@ -711,6 +728,17 @@ def main():
         else:
             print("GRASP feasible = False; warm start/UB disabled.", flush=True)
 
+    if global_time_remaining() <= 0:
+        stop_before_cplex(
+            "global-time-limit-after-GRASP",
+            {
+                "grasp_time": grasp_time,
+                "kernel_time": kernel_time,
+                "model_time": model_time,
+            },
+        )
+        return
+
     #kernelization and essential node detection
     time_kernel_start = time()      
     pair_sets = compute_separation_sets(G, R, B)
@@ -723,6 +751,18 @@ def main():
 
     print("Remaining nodes after kernelization:", len(all_nodes), flush=True)
     print("Remaining rows:", len(pair_sets), flush=True)
+
+    if global_time_remaining() <= 0:
+        state["LB"] = float(len(essential))
+        stop_before_cplex(
+            "global-time-limit-after-kernelization",
+            {
+                "grasp_time": grasp_time,
+                "kernel_time": kernel_time,
+                "model_time": model_time,
+            },
+        )
+        return
 
     # A trivial, always-valid lower bound after essential-node detection.
     state["LB"] = float(len(essential))
@@ -738,10 +778,31 @@ def main():
     mdl, x_vars, remaining_nodes = generate_docplex_model(
         G, pair_sets, essential, heuristic_solution, all_nodes
     )
-    model_time = time() - model_time_start  
+    model_time = time() - model_time_start
+
+    # CPLEX receives only the time remaining from the global wall-clock budget.
+    remaining_for_cplex = global_time_remaining()
+
+    if remaining_for_cplex <= 0:
+        state["LB"] = float(len(essential))
+        stop_before_cplex(
+            "global-time-limit-after-model-generation",
+            {
+                "grasp_time": grasp_time,
+                "kernel_time": kernel_time,
+                "model_time": model_time,
+            },
+        )
+        return
+
+    print(
+        f"Elapsed before CPLEX solve: {time() - overall_start:.2f}s; "
+        f"remaining global budget for CPLEX: {remaining_for_cplex:.2f}s",
+        flush=True,
+    )
 
     # model parameters for CPLEX    
-    mdl.parameters.timelimit = time_limit
+    mdl.parameters.timelimit = remaining_for_cplex
     mdl.parameters.threads = 1
 
     #stats of preprocessinf steps (GRASP, kernelization, model generation):
@@ -752,13 +813,12 @@ def main():
     }
 
     #Model solving with periodic checkpointing of UB/LB and other stats (GRASP, kernelization, model generation times)
-    solve_start = time()  
-    #overall_start = time()
+    solve_start = time()
     cb = mdl.register_callback(ILPCheckpointCallback)
     cb.setup(
         output_file=output_file,
         state=state,
-        start_wall=solve_start,
+        start_wall=overall_start,
         checkpoint_seconds=args.checkpoint_seconds,
         checkpoint_nodes=args.checkpoint_nodes,
     )
@@ -767,7 +827,7 @@ def main():
     #cplex solve:
     #time_cplex_start = time()
     sol = mdl.solve(log_output=True)
-    total_time = round(time() - solve_start, 2)
+    total_time = round(time() - overall_start, 2)
     #time_ilp_approach_run = round(time() - time_cplex_start, 2)
     details = mdl.solve_details
 
@@ -806,7 +866,7 @@ def main():
         # already recorded a valid incumbent and a useful certified lower bound.
         state["Status"] = str(getattr(details, "status", "No solution"))
 
-    state["Time"] = total_time
+    state["Time"] = time() - overall_start
 
     try:
         state["NodesProcessed"] = int(getattr(details, "nb_nodes_processed", state["NodesProcessed"]))

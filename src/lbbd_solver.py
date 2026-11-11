@@ -114,6 +114,40 @@ def _relative_gap(lb, ub):
         return None
 
 
+def _master_log_path(output_path):
+    """Return a .log path with the same basename as the requested output file."""
+    p = Path(output_path)
+    return str(p.with_suffix(".log"))
+
+
+def _initialize_master_log(output_path):
+    """Create/truncate the per-master log at the beginning of a run."""
+    log_path = _master_log_path(output_path)
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w") as log_file:
+        log_file.write("# LBBD restricted-master log\n")
+        log_file.write("# Each block records one master solve.\n")
+        log_file.flush()
+        os.fsync(log_file.fileno())
+    return log_path
+
+
+def _append_master_log(log_path, record):
+    """Append one master-solve record and flush it immediately to disk."""
+    if not log_path:
+        return
+
+    with open(log_path, "a") as log_file:
+        log_file.write(f"\n[master {record.get('iteration')}]\n")
+        log_file.write(f"status: {record.get('status')}\n")
+        log_file.write(f"best_bound_raw: {record.get('best_bound_raw')}\n")
+        log_file.write(f"best_bound_integer: {record.get('best_bound_integer')}\n")
+        log_file.write(f"objective: {record.get('objective')}\n")
+        log_file.write(f"elapsed: {record.get('elapsed')}\n")
+        log_file.flush()
+        os.fsync(log_file.fileno())
+
+
 def _write_lbbd_checkpoint(path, stats, reason="periodic", checkpoint=True, other_stats=None):
     """Atomically persist the latest LBBD state.
 
@@ -147,9 +181,10 @@ def _write_lbbd_checkpoint(path, stats, reason="periodic", checkpoint=True, othe
         f"elapsed: {float(stats.get('elapsed', 0.0)):.6f}\n",
         f"checkpoint: {checkpoint}\n",
         f"checkpoint_reason: {reason}\n",
-        f"kernel time: {other_stats['kernelization_time']:.6f}\n" if other_stats and 'kernelization_time' in other_stats else "",  
+        f"kernel time: {other_stats['kernelization_time']:.6f}\n" if other_stats and 'kernelization_time' in other_stats else "",
         f"grasp time: {other_stats['grasp_time']:.6f}\n" if other_stats and 'grasp_time' in other_stats else ""
     ]
+
      
     with open(tmp_path, "w") as out_file:
         out_file.writelines(lines)
@@ -264,6 +299,9 @@ def solve_lbbd(
     last_master_solution = None
     last_master_objective = None
 
+    # Per-master diagnostics are written to a separate sibling .log file.
+    master_log_path = _initialize_master_log(checkpoint_path) if checkpoint_path else None
+
     # A feasible warm start is already a valid full-problem incumbent.
     best_feasible_solution = list(initial_solution) if warm_start is not None else None
     best_feasible_value = initial_value
@@ -341,21 +379,39 @@ def solve_lbbd(
         # CPLEX best_bound is the valid lower bound for the current restricted
         # master. Since the complete problem has all these constraints and
         # possibly more, this is also a valid lower bound for the full problem.
-        current_lb = getattr(solve_details, "best_bound", None)
-        if current_lb is not None:
-            try:
+        #
+        # Keep BOTH the raw floating-point bound and the safely rounded integer
+        # bound used internally by LBBD.
+        current_lb_raw = getattr(solve_details, "best_bound", None)
+        try:
+            current_lb_raw = (
+                float(current_lb_raw)
+                if current_lb_raw is not None and math.isfinite(float(current_lb_raw))
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            current_lb_raw = None
 
-                current_lb = _integer_lower_bound(current_lb)
-                if current_lb is not None and current_lb > best_lower_bound:
-                    # CPLEX best_bound is certified even if the master stops on
-                    # a time limit.  Never substitute the incumbent objective
-                    # for this bound unless the master is solved to optimality.
-                    best_lower_bound = current_lb
-            except (TypeError, ValueError):
-                pass
+        current_lb = _integer_lower_bound(current_lb_raw)
+
+        master_record = {
+            "iteration": iteration,
+            "status": str(solve_details.status),
+            "best_bound_raw": current_lb_raw,
+            "best_bound_integer": current_lb,
+            "objective": None,
+            "elapsed": time() - start_time,
+        }
+
+        if current_lb is not None and current_lb > best_lower_bound:
+            # CPLEX best_bound is certified even if the master stops on
+            # a time limit. Never substitute the incumbent objective for
+            # this bound unless the master is solved to optimality.
+            best_lower_bound = current_lb
 
         if sol is None:
             print("No master solution was returned.")
+            _append_master_log(master_log_path, master_record)
             status = "time_limit" if "time" in str(solve_details.status).lower() else "no_solution"
             maybe_checkpoint(reason="master-no-solution", force=True, status=status, other_stats=other_stats)
             signal.signal(signal.SIGTERM, previous_sigterm_handler)
@@ -364,6 +420,9 @@ def solve_lbbd(
         chosen = [v for v in nodes if x[v].solution_value > 0.5]
         last_master_solution = sorted(chosen)
         last_master_objective = float(mdl.objective_value)
+        master_record["objective"] = last_master_objective
+        master_record["elapsed"] = time() - start_time
+        _append_master_log(master_log_path, master_record)
 
         # When a restricted master is solved to optimality, its optimum itself
         # is a valid lower bound and is often stronger/more stable than the
@@ -376,8 +435,11 @@ def solve_lbbd(
         violated = find_violated_pairs(chosen, pair_sets, added_pairs)
 
         print(
-            f"  objective: {last_master_objective:g}, "
-            f"current_LB: {current_lb}, best_LB: {None if best_lower_bound == float('-inf') else best_lower_bound:g}, "
+            f"  master_status: {solve_details.status}, "
+            f"objective: {last_master_objective:g}, "
+            f"current_LB_raw: {current_lb_raw}, "
+            f"current_LB_integer: {current_lb}, "
+            f"best_LB: {None if best_lower_bound == float('-inf') else best_lower_bound:g}, "
             f"violated_unadded: {len(violated)}, elapsed: {time() - start_time:.2f}s"
         )
 
@@ -628,10 +690,15 @@ def kernelize(pair_sets, essential, all_nodes):
             
 def main():
     
+    # Global wall-clock timer: --time_limit applies to the complete algorithm,
+    # including input handling, sanity checking, preprocessing/kernelization,
+    # GRASP, and the LBBD phase.
+    algorithm_start_time = time()
+
     parser = argparse.ArgumentParser(description="ILP Red-Blue Separator with CPLEX and log parsing")
     parser.add_argument("-i", "--i", required=True, help="Input CSV graph file in DIMACS format")
     parser.add_argument("-o", "--o", required=True, help="Output file path for results")
-    parser.add_argument("-t", "--time_limit", type=float, default=60.0, help="CPLEX time limit in seconds")
+    parser.add_argument("-t", "--time_limit", type=float, default=60.0, help="Global wall-clock limit in seconds for preprocessing, GRASP, and LBBD together.")
     parser.add_argument("-warm_start", "--warm_start", type=int, default=1, help="CPLEX time limit in seconds")
     parser.add_argument(
         "--max_cuts_per_iteration",
@@ -684,7 +751,7 @@ def main():
             out_file.write("last_master_solution: None\n")
             out_file.write("iterations: 0\n")
             out_file.write("cuts_added: 0\n")
-            out_file.write("elapsed: 0.000000\n")
+            out_file.write(f"elapsed: {time() - algorithm_start_time:.6f}\n")
         return
 
     # run preprocessing steps: compute separation sets, find essential nodes, and kernelize the instance     
@@ -696,16 +763,46 @@ def main():
     pair_sets, all_nodes = kernelize(pair_sets, essential, all_nodes)
     kernelization_time_overall = time() - time_of_kernelization_start
 
+    # If preprocessing alone exhausted the global budget, stop here.
+    if time() - algorithm_start_time >= time_limit:
+        total_elapsed = time() - algorithm_start_time
+        with open(output_file, "w") as out_file:
+            out_file.write("status: time_limit\n")
+            out_file.write("LB: None\n")
+            out_file.write("UB: None\n")
+            out_file.write("gap: None\n")
+            out_file.write("initial_value: None\n")
+            out_file.write("initial_solution: []\n")
+            out_file.write("best_lower_bound: None\n")
+            out_file.write("best_feasible_value: None\n")
+            out_file.write("best_feasible_solution: None\n")
+            out_file.write("last_master_objective: None\n")
+            out_file.write("last_master_solution: None\n")
+            out_file.write("iterations: 0\n")
+            out_file.write("cuts_added: 0\n")
+            out_file.write(f"elapsed: {total_elapsed:.6f}\n")
+            out_file.write("final_feasible: False\n")
+            out_file.write("checkpoint: False\n")
+            out_file.write("checkpoint_reason: global-time-limit-after-preprocessing\n")
+            out_file.write(f"kernelization_time: {kernelization_time_overall}\n")
+            out_file.write("grasp_time: None\n")
+        return
+
     heuristic_solution = None
     heuristic_value = None
+    grasp_time_overall = None
 
     if warm_start == 1:
         
-        print("Running GRASP warm start with k=5, #numiter=10...")
+        remaining_before_grasp = time_limit - (time() - algorithm_start_time)
+        print(
+            f"Running GRASP warm start with k=5, #numiter=10... "
+            f"(global remaining time before GRASP: {remaining_before_grasp:.2f}s)"
+        )
         from LS import build_pair_cover_map
         pair_sets_grasp =  build_pair_cover_map(G, R, B)
         time_of_grasp_start = time()
-        candidate = grasp_mrbssp(G=G, R=R, B=B, k=5, max_iter=10, seed=None, pair_cover_map=pair_sets_grasp, forbidden=None)  #, time_limit)  # max_iter=50
+        candidate = grasp_mrbssp(G=G, R=R, B=B, k=5, max_iter=10, seed=None, pair_cover_map=pair_sets_grasp)  #, time_limit)  # max_iter=50
         grasp_time_overall = time() - time_of_grasp_start   
 
         #print(candidate)  
@@ -725,14 +822,51 @@ def main():
                 "Disabling both the MIP start and the GRASP upper bound."
             )
 
-    # Run incremental LBBD.
+    # The LBBD phase receives only the time remaining from the global budget.
+    elapsed_before_lbbd = time() - algorithm_start_time
+    remaining_for_lbbd = time_limit - elapsed_before_lbbd
+
+    if remaining_for_lbbd <= 0:
+        total_elapsed = time() - algorithm_start_time
+        final_feasible = (
+            heuristic_solution is not None
+            and checkFeasibility(heuristic_solution, G, R, B)
+        )
+        with open(output_file, "w") as out_file:
+            out_file.write("status: time_limit\n")
+            out_file.write("LB: None\n")
+            out_file.write(f"UB: {heuristic_value}\n")
+            out_file.write("gap: None\n")
+            out_file.write(f"initial_value: {heuristic_value}\n")
+            out_file.write(f"initial_solution: {sorted(heuristic_solution) if heuristic_solution is not None else []}\n")
+            out_file.write("best_lower_bound: None\n")
+            out_file.write(f"best_feasible_value: {heuristic_value}\n")
+            out_file.write(f"best_feasible_solution: {sorted(heuristic_solution) if heuristic_solution is not None else None}\n")
+            out_file.write("last_master_objective: None\n")
+            out_file.write("last_master_solution: None\n")
+            out_file.write("iterations: 0\n")
+            out_file.write("cuts_added: 0\n")
+            out_file.write(f"elapsed: {total_elapsed:.6f}\n")
+            out_file.write(f"final_feasible: {final_feasible}\n")
+            out_file.write("checkpoint: False\n")
+            out_file.write("checkpoint_reason: global-time-limit-before-LBBD\n")
+            out_file.write(f"kernelization_time: {kernelization_time_overall}\n")
+            out_file.write(f"grasp_time: {grasp_time_overall}\n")
+        return
+
+    print(f"Per-master log file: {_master_log_path(output_file)}")
+    print(
+        f"Elapsed before LBBD: {elapsed_before_lbbd:.2f}s; "
+        f"remaining global budget for LBBD: {remaining_for_lbbd:.2f}s"
+    )
+
     result = solve_lbbd(
         all_nodes,
         pair_sets,
         essential=essential,
         warm_start=heuristic_solution,
         ub=heuristic_value,
-        time_limit=time_limit,
+        time_limit=remaining_for_lbbd,
         max_cuts_per_iteration=args.max_cuts_per_iteration,
         cut_strategy=args.cut_strategy,
         checkpoint_path=output_file,
@@ -740,7 +874,7 @@ def main():
         checkpoint_seconds=args.checkpoint_seconds,
         other_stats={
             "kernelization_time": kernelization_time_overall,
-            "grasp_time": grasp_time_overall if warm_start == 1 else None,
+            "grasp_time": grasp_time_overall,
         }   
     )
 
@@ -760,6 +894,7 @@ def main():
         )
         stats["status"] = "invalid"
 
+    stats["elapsed"] = time() - algorithm_start_time
     final_gap = _relative_gap(stats["best_lower_bound"], stats["best_feasible_value"])
     with open(output_file, "w") as out_file:
         out_file.write(f"status: {stats['status']}\n")
@@ -781,6 +916,7 @@ def main():
         out_file.write("checkpoint_reason: final\n")
         out_file.write(f"kernelization_time: {stats['kernelization_time']}\n")
         out_file.write(f"grasp_time: {stats['grasp_time']}\n")
+
     
 
 if __name__=="__main__":
